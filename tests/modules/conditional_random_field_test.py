@@ -27,6 +27,7 @@ class TestConditionalRandomField(AllenNlpTestCase):
         )
         self.tags = torch.LongTensor([[2, 3, 4], [3, 2, 2]])
 
+        # N=5个状态的转换概率
         self.transitions = torch.Tensor(
             [
                 [0.1, 0.2, 0.3, 0.4, 0.5],
@@ -37,17 +38,26 @@ class TestConditionalRandomField(AllenNlpTestCase):
             ]
         )
 
+        # 初始时每个状态的概率，N=5
         self.transitions_from_start = torch.Tensor([0.1, 0.2, 0.3, 0.4, 0.6])
+        # 结束时每个状态的概率，N=5，不是很懂为何有这个概率(hkx)
         self.transitions_to_end = torch.Tensor([-0.1, -0.2, 0.3, -0.4, -0.4])
 
         # Use the CRF Module with fixed transitions to compute the log_likelihood
-        self.crf = ConditionalRandomField(5)
+        self.crf = ConditionalRandomField(num_tags=5) # 即有5个状态转换
+        # [N,N]
         self.crf.transitions = torch.nn.Parameter(self.transitions)
+        # [N,]
         self.crf.start_transitions = torch.nn.Parameter(self.transitions_from_start)
+        # [N,]
         self.crf.end_transitions = torch.nn.Parameter(self.transitions_to_end)
 
     def score(self, logits, tags):
         """
+        对于给定的序列，计算概率
+        logits:[seq_len, N]
+        tags:  [seq_len,]
+
         Computes the likelihood score for the given sequence of tags,
         given the provided logits (and the transition weights in the CRF model)
         """

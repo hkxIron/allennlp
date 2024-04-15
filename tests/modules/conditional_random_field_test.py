@@ -19,15 +19,18 @@ from allennlp.common.testing import AllenNlpTestCase
 class TestConditionalRandomField(AllenNlpTestCase):
     def setup_method(self):
         super().setup_method()
+        # logits:[batch, seq_len, state_num]
         self.logits = torch.Tensor(
             [
                 [[0, 0, 0.5, 0.5, 0.2], [0, 0, 0.3, 0.3, 0.1], [0, 0, 0.9, 10, 1]],
                 [[0, 0, 0.2, 0.5, 0.2], [0, 0, 3, 0.3, 0.1], [0, 0, 0.9, 1, 1]],
             ]
         )
+        # tags:[batch, seq_len]
         self.tags = torch.LongTensor([[2, 3, 4], [3, 2, 2]])
 
-        # N=5个状态的转换概率
+        # state_num=N=5个状态的转换概率
+        # transitions:[state_num, state_num]
         self.transitions = torch.Tensor(
             [
                 [0.1, 0.2, 0.3, 0.4, 0.5],
@@ -39,54 +42,93 @@ class TestConditionalRandomField(AllenNlpTestCase):
         )
 
         # 初始时每个状态的概率，N=5
+        # transitions_from_start:[state_num]
         self.transitions_from_start = torch.Tensor([0.1, 0.2, 0.3, 0.4, 0.6])
         # 结束时每个状态的概率，N=5，不是很懂为何有这个概率(hkx)
+        # transitions_to_end:[state_num]
         self.transitions_to_end = torch.Tensor([-0.1, -0.2, 0.3, -0.4, -0.4])
 
         # Use the CRF Module with fixed transitions to compute the log_likelihood
         self.crf = ConditionalRandomField(num_tags=5) # 即有5个状态转换
-        # [N,N]
+        # [state_num, state_num]
         self.crf.transitions = torch.nn.Parameter(self.transitions)
-        # [N,]
+        # [state_num,]
         self.crf.start_transitions = torch.nn.Parameter(self.transitions_from_start)
-        # [N,]
+        # [state_num,]
         self.crf.end_transitions = torch.nn.Parameter(self.transitions_to_end)
 
     def score(self, logits, tags):
         """
         对于给定的序列，计算概率
-        logits:[seq_len, N]
+        logits:[seq_len, state_num]
         tags:  [seq_len,]
 
         Computes the likelihood score for the given sequence of tags,
         given the provided logits (and the transition weights in the CRF model)
         """
         # Start with transitions from START and to END
+        # TODO:但我并不清楚为何最后的分布也需要指定？
         total = self.transitions_from_start[tags[0]] + self.transitions_to_end[tags[-1]]
         # Add in all the intermediate transitions
         for tag, next_tag in zip(tags, tags[1:]):
-            total += self.transitions[tag, next_tag]
+            total += self.transitions[tag, next_tag] # 前后tag之间转移的分数
         # Add in the logits for the observed tags
+        # logits:[seq_len, state_num],对应于CRF中各个时间步的 w*feat(xi,j,s(j-1),s(j)), feat(*)为crf中全局特征
+        # tags:[seq_len]
+        # p(s|x;w) = exp(w*feat(xi,j,s(j-1),s(j)))/Z, xi指第i条样本, s为state, j为第j个时间步, Z为归一化因子
         for logit, tag in zip(logits, tags):
             total += logit[tag]
         return total
 
     def naive_most_likely_sequence(self, logits, mask):
+        # 手工验证viterbi解码的正确性
+        # logits:[batch, seq_len, state_num]
+        # mask:  [batch, seq_len]
+
         # We iterate over all possible tag sequences and use self.score
         # to check the likelihood of each. The most likely sequence should be the
         # same as what we get from viterbi_tags.
+       
+        # 对于每一条样本，暴力找出最有可能的状态路径 
+        # most_likely_tags:[batch, seq_len]
+        # best_scores:[batch]
         most_likely_tags = []
         best_scores = []
 
+        # logits:[batch, seq_len, state_num]
+        # mask:  [batch, seq_len]
         for logit, mas in zip(logits, mask):
-            mask_indices = mas.nonzero(as_tuple=False).squeeze()
+            # 找出每个seq序列中不被mask掉的logit
+            mask_indices = mas.nonzero(as_tuple=False).squeeze() # 找出非0元素
             logit = torch.index_select(logit, 0, mask_indices)
+            # logit:[seq_len, state_num]
             sequence_length = logit.shape[0]
+            # state_num=5
+            state_num=logit.shape[1]
             most_likely, most_likelihood = None, -float("inf")
-            for tags in itertools.product(range(5), repeat=sequence_length):
-                score = self.score(logit.data, tags)
+            # product枚举所有state且长度为sequence_length的序列组合
+            # 可枚举的序列长度是：state_num^seq_len
+            """
+            eg:
+            >>> for x in itertools.product([0,1], repeat=3):
+                    print(x)
+                输出2^3=8种组合:
+                (0, 0, 0)
+                (0, 0, 1)
+                (0, 1, 0)
+                (0, 1, 1)
+                (1, 0, 0)
+                (1, 0, 1)
+                (1, 1, 0)
+                (1, 1, 1)
+            """
+            for tag_seq in itertools.product(range(state_num), repeat=sequence_length):
+                #logit: [seq_len, state_num]
+                #tag_seq: [seq_len, ]
+                score = self.score(logit.data, tag_seq)
                 if score > most_likelihood:
-                    most_likely, most_likelihood = tags, score
+                    most_likely, most_likelihood = tag_seq, score
+
             # Convert tuple to list; otherwise == complains.
             most_likely_tags.append(list(most_likely))
             best_scores.append(most_likelihood)
@@ -94,7 +136,10 @@ class TestConditionalRandomField(AllenNlpTestCase):
         return most_likely_tags, best_scores
 
     def test_forward_works_without_mask(self):
-        log_likelihood = self.crf(self.logits, self.tags).item()
+        # inputs = logits:[batch, seq_len, state_num]
+        # tags:[batch, seq_len]
+        # log_likelihood:[batch,]
+        log_likelihood = self.crf.forward(inputs=self.logits, tags=self.tags).item()
 
         # Now compute the log-likelihood manually
         manual_log_likelihood = 0.0

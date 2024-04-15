@@ -279,11 +279,14 @@ class ConditionalRandomField(torch.nn.Module):
         tags: torch.Tensor,
         mask: torch.BoolTensor,
     ) -> torch.Tensor:
-        """Computes the numerator term for the log-likelihood, which is just score(inputs, tags)
+        """
+        计算log P(y|x;w)中的分子，即:
+         log p(s|x;w) = log[exp(w*feat(xi,j,s(j-1),s(j)))/Z], xi指第i条样本, s为state, j为第j个时间步, Z为归一化因子,
+         分子为w*feat(xi,j,s(j-1),s(j), 其中feat(xi,j,s(j-1),s(j))包含了转移概率，发射概率
 
+        Computes the numerator term for the log-likelihood, which is just score(inputs, tags)
         Args:
-            logits (torch.Tensor): a (batch_size, sequence_length num_tags) tensor of unnormalized
-                log-probabilities
+            logits (torch.Tensor): a (batch_size, sequence_length num_tags) tensor of unnormalized log-probabilities
             transitions (torch.Tensor): a (batch_size, num_tags, num_tags) tensor of transition scores
             tags (torch.Tensor): output tag sequences (batch_size, sequence_length) $y$ for each input sequence
             mask (torch.BoolTensor): a (batch_size, sequence_length) tensor of masking flags
@@ -294,47 +297,93 @@ class ConditionalRandomField(torch.nn.Module):
         batch_size, sequence_length, _ = logits.data.shape
 
         # Transpose batch size and sequence dimensions:
+        # logits:[batch, seq_len, num_tags] -> [seq_len, batch, num_tags]
         logits = logits.transpose(0, 1).contiguous()
+        # mask:[batch, seq_len] -> [seq_len, batch]
         mask = mask.transpose(0, 1).contiguous()
+        # tags:[batch, seq_len] -> [seq_len, batch]
         tags = tags.transpose(0, 1).contiguous()
 
         # Start with the transition scores from start_tag to the first tag in each input
         if self.include_start_end_transitions:
+            # start_transitions:[num_tags], 初始分布
+            # tags:[seq_len, batch], tags[0]:[batch]
+            # score:[batch]
             score = self.start_transitions.index_select(0, tags[0])
         else:
             score = 0.0
 
         # Add up the scores for the observed transitions and all the inputs but the last
-        for i in range(sequence_length - 1):
+        for t in range(sequence_length - 1):
             # Each is shape (batch_size,)
-            current_tag, next_tag = tags[i], tags[i + 1]
+            # current_tag:[batch], next_tag:[batch]
+            current_tag, next_tag = tags[t], tags[t + 1]
 
-            # The scores for transitioning from current_tag to next_tag
+            # The scores for transitioning from current_tag to next_tag, [batch]
+            # transitions:[num_tags, num_tags]
+            # transition_score:[batch] 获取tag[t]->tag[t+1]的转移分数, current_tag作为下标
             transition_score = transitions[current_tag.view(-1), next_tag.view(-1)]
 
             # The score for using current_tag
-            emit_score = logits[i].gather(1, current_tag.view(batch_size, 1)).squeeze(1)
+            # logits: [seq_len, batch, num_tags]
+            #
+            # index=current_tag:[batch, 1]
+            # [[tag1],
+            #  [tag2],
+            #  [tag3],
+            # ]
+            #
+            # index of index:
+            # [(0,0)
+            #  (1,0)
+            #  (2,0)
+            # ...]
+            #
+            # dim=1,因此将index的值依次填index_of_index对应的dim=1上
+            # new_index=
+            # [(0,tag1)
+            #  (1,tag2)
+            #  (2,tag3)
+            # ...]
+            # 从logits[t]取new_index的值
+            # [[s1],[s2],...]
+            # emit_score_origin: [batch,1], 即每条样本它的state所对应的发射分数
+            emit_score_origin = logits[t].gather(dim=1, index=current_tag.view(batch_size, 1))
+            # emit_score: [batch]
+            emit_score = emit_score_origin.squeeze(1)
 
             # Include transition score if next element is unmasked,
             # input_score if this element is unmasked.
-            score = score + transition_score * mask[i + 1] + emit_score * mask[i]
+            # score:[batch]
+            # transition_score:[batch]
+            # emit_score: [batch]
+            # mask:[seq_len, batch] -> mask[t]:[batch]
+            score = score + transition_score * mask[t + 1] + emit_score * mask[t]
 
         # Transition from last state to "stop" state. To start with, we need to find the last tag
         # for each instance.
+        # mask:[seq_len, batch]
+        # last_tag_index:[batch]
         last_tag_index = mask.sum(0).long() - 1
+        # tags:[seq_len, batch]
+        # tags:[batch], 获取每条样本最后的tag
         last_tags = tags.gather(0, last_tag_index.view(1, batch_size)).squeeze(0)
 
         # Compute score of transitioning to `stop_tag` from each "last tag".
         if self.include_start_end_transitions:
+            # tags:[batch]
+            # start_transitions:[num_tags], 初始分布
+            # last_transition_score:[batch]
             last_transition_score = self.end_transitions.index_select(0, last_tags)
         else:
             last_transition_score = 0.0
 
         # Add the last input if it's not masked.
+        # logits:[seq_len, batch, num_tags], logits[-1]:[batch, num_tags]
         last_inputs = logits[-1]  # (batch_size, num_tags)
         last_input_score = last_inputs.gather(1, last_tags.view(-1, 1))  # (batch_size, 1)
         last_input_score = last_input_score.squeeze()  # (batch_size,)
-
+        # score:[batch], 逐条样本将所有时间步的转移与发射概率相加
         score = score + last_transition_score + last_input_score * mask[-1]
 
         return score
@@ -343,6 +392,7 @@ class ConditionalRandomField(torch.nn.Module):
         self, inputs: torch.Tensor, tags: torch.Tensor, mask: torch.BoolTensor = None
     ) -> torch.Tensor:
         """Computes the log likelihood for the given batch of input sequences $(x,y)$
+        计算输入的序列logits+tags的概率
 
         Args:
             inputs (torch.Tensor): (batch_size, sequence_length, num_tags) tensor of logits for the inputs $x$
@@ -359,9 +409,19 @@ class ConditionalRandomField(torch.nn.Module):
             # The code below fails in weird ways if this isn't a bool tensor, so we make sure.
             mask = mask.to(torch.bool)
 
+        # p(y|x;w) = exp(w*feat(xi,j,y(j-1),y(j)))/Z, xi指第i条样本,y为state, j为第j个时间步, Z为归一化因子
+        # log p(y|x)
+        # 求解分母,log_Z=log(sum(p(y|x;w))) over all y1~yt序列
+        # inputs:[batch,seq_len, state_num]
+        # transitions:[state_num, state_num]
+        # mask:[batch, seq_len]
+        # log_denominator:[batch]
         log_denominator = self._input_likelihood(inputs, self.transitions, mask)
+        # 求解分子: w*feat(xi,j,y(j-1),y(j))
+        # log_numerator:[batch]
         log_numerator = self._joint_likelihood(inputs, self.transitions, tags, mask)
 
+        # result:[1], sum of log(p(y|x)) in batch
         return torch.sum(log_numerator - log_denominator)
 
     def viterbi_tags(

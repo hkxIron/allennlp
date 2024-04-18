@@ -318,7 +318,7 @@ class ConditionalRandomField(torch.nn.Module):
 
         # Finally we log_sum_exp along the num_tags dim, result is (batch_size,)
         # stops:[batch, num_tags] -> [batch]
-        # 将到达不同最终state的分数相加
+        # 利用logsumexp性质, 将到达不同最终state的分数相加,得到最终的归一化分数logsumexp(z)
         # logsumexp性质：F(x+y+z+w)=F(F(x+y)+F(z+w))
         # 设F(x)=logsumexo(x),
         # F(F(x+y)+F(z+w))=logsumexp(logsumexp(x+y)+logsumexp(z+w))

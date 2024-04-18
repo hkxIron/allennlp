@@ -279,8 +279,20 @@ class ConditionalRandomField(torch.nn.Module):
 
             # Add all the scores together and logexp over the current_tag axis.
             # inner:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
-            # 这里的inner就是 w*feat(xi,j,s(j-1),s(j)), 即:转移分数 + 发射分数
-            # alpha(t,s) = sum_{s'} {alpha(t-1, s') * psai(s',s,t) }, s'为t-1时的状态
+            # 这里的inner就是前向计算中的alpha
+
+            # 前向计算公式
+            # psai(s(j-1),s(j),t) = exp(w*feat(s(j-1),sj,t)) 为势函数
+            # alpha(t,s) = sum_{s(j-1)} {alpha(t-1, s(j-1)) * psai(s(j-1),sj,t) }, s(j-1)为t-1时的状态
+            #
+            # crf log概率：logp(y|x) = w*feat(x,j,s(j-1),sj)/logsum(exp(w*feat(x,j,s(j-1),sj)))
+            # 分子为w*feat(x,j,s(j-1),sj)
+            # 在crf中，一般feat(*)函数有k个，但在NN+CRF中，一般只用一个feat函数，因为NN抽取特征能力很强，可以认为它已经是多个feat(*)函数之和
+            # 因此认为分子w*feat(x,s(j-1),sj)= w1*transition(x,s(j-1),sj)+ w2*emit(x,sj) = 转移分数 + 发射分数
+            # 其中：
+            # 转移分数=w1*transition(x,s(j-1),sj)
+            # 发射分数=w2*transition(x,sj)
+
             # broadcast_alpha:[batch, num_tags, 1], 到达当前state的概率
             # transition_scores:[1, num_tags, num_tags], 当前状态到下一状态的转移概率
             # emit_scores:[batch, 1, num_tags], 下一状态的发射概率

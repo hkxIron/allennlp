@@ -214,6 +214,7 @@ class ConditionalRandomField(torch.nn.Module):
             torch.nn.init.normal_(self.start_transitions)
             torch.nn.init.normal_(self.end_transitions)
 
+    # 计算logP(y|x)分母
     def _input_likelihood(
         self, logits: torch.Tensor, transitions: torch.Tensor, mask: torch.BoolTensor
     ) -> torch.Tensor:
@@ -246,13 +247,13 @@ class ConditionalRandomField(torch.nn.Module):
         # transitions to the initial states and the logits for the first timestep.
         # alpha(t, s):是前向后向算法里的前向节点,代表第t个时间步，到达状态s的概率
         if self.include_start_end_transitions:
-            # start_transitions:[1,num_tags], 初始分布
-            # logits[0]:[batch, num_tags]
+            # start_transitions:[1, num_tags], 初始分布
+            # logits[0]:[batch, num_tags]，代表各状态的发射概率
             # alpha:[batch, num_tags]
             alpha = self.start_transitions.view(1, num_tags) + logits[0]
         else:
             # alpha:[batch, num_tags]
-            alpha = logits[0]
+            alpha = logits[0] # 只用发射概率初始化
 
         # alpha(t, s):是前向后向算法里的前向节点,代表第t个时间步，到达状态s的概率
         # psai(xi,st-1,st,t) = w*feat(xi, j, sj-1, sj), 这里包含了转移概率与发射概率
@@ -267,38 +268,56 @@ class ConditionalRandomField(torch.nn.Module):
             # emit_scores:[batch, 1, num_tags]
             emit_scores = logits[t].view(batch_size, 1, num_tags)
             # Transition scores are (current_tag, next_tag) so we broadcast along the instance axis.
-            # transitions:[num_tags, num_tags]
-            # transition_scores:[1, num_tags, num_tags]
+            # transitions:[num_tags, num_tags], 当前状态到下一状态的转移概率
+            # transition_scores:[1, num_tags(当前状态), num_tags(下一状态)], 当前状态到下一状态的转移概率
             transition_scores = transitions.view(1, num_tags, num_tags)
+
             # Alpha is for the current_tag, so we broadcast along the next_tag axis.
-            # alpha:[batch, num_tags, 1]
+            # broadcast_alpha:[batch, num_tags, 1]
+            # alpha(t, s):是前向后向算法里的前向节点,代表第t个时间步到达状态s的概率
             broadcast_alpha = alpha.view(batch_size, num_tags, 1)
 
             # Add all the scores together and logexp over the current_tag axis.
             # inner:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
-            # 这里的inner就是 w*feat(xi,j,s(j-1),s(j)), 即转移分数 + 发射分数
+            # 这里的inner就是 w*feat(xi,j,s(j-1),s(j)), 即:转移分数 + 发射分数
             # alpha(t,s) = sum_{s'} {alpha(t-1, s') * psai(s',s,t) }, s'为t-1时的状态
-            inner = broadcast_alpha + emit_scores + transition_scores
+            # broadcast_alpha:[batch, num_tags, 1], 到达当前state的概率
+            # transition_scores:[1, num_tags, num_tags], 当前状态到下一状态的转移概率
+            # emit_scores:[batch, 1, num_tags], 下一状态的发射概率
+            # inner:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
+            inner = broadcast_alpha + transition_scores + emit_scores
 
             # In valid positions (mask == True) we want to take the logsumexp over the current_tag dimension
             # of `inner`. Otherwise (mask == False) we want to retain the previous alpha.
             # mask[t]:[batch]
-            # inner:[batch, num_tags:prev_state, num_tags:cur_state],
-            # tag_score:[batch, num_tags]
-            tag_score = util.logsumexp(inner, 1) # dim=1是按当前cur_tag进行sum
+            # inner:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
+            # tag_score:[batch, num_tags], log{sum{exp(w*feat(s',s,x,t))}}
+            tag_score = util.logsumexp(inner, 1) # dim=1是按当前状态进行sum
             # alpha:[batch, num_tags]
             alpha = (tag_score * mask[t].view(batch_size, 1) + alpha * (~mask[t]).view(batch_size, 1))
 
         # Every sequence needs to end with a transition to the stop_tag.
         if self.include_start_end_transitions:
+            # 性质：F(A+B)=F(A)+B
+            #log(sum(exp(A + B))) = log(sum(exp(A))) + B, 即加上最后时间步t的分数
             stops = alpha + self.end_transitions.view(1, num_tags)
         else:
             stops = alpha
 
         # Finally we log_sum_exp along the num_tags dim, result is (batch_size,)
         # stops:[batch, num_tags] -> [batch]
+        # 将到达不同最终state的分数相加
+        # logsumexp性质：F(x+y+z+w)=F(F(x+y)+F(z+w))
+        # 设F(x)=logsumexo(x),
+        # F(F(x+y)+F(z+w))=logsumexp(logsumexp(x+y)+logsumexp(z+w))
+        # =logsumexp(log[sumexp(x+y)*sumexp(z+w)])
+        # =logsum[exp(x+y)*exp(z+w)] # 从上一步到此步是因为sum里只有一个元素
+        # =logsum(exp(x+y+z+w)))
+        # =F(x+y+z+w)
         return util.logsumexp(stops)
 
+
+    # 计算logP(y|x)分子
     def _joint_likelihood(
         self,
         logits: torch.Tensor,

@@ -1224,12 +1224,18 @@ def logsumexp(tensor: torch.Tensor, dim: int = -1, keepdim: bool = False) -> tor
     `tensor.exp().sum(dim, keep=keepdim).log()`.  This function is typically used for summing log
     probabilities.
 
+    logsumexp函数性质:F(A+B)=F(A)+B
+
     log(sum(exp(x))) = log(sum(exp(x-A+A)))
     = log(sum[exp(x-A)*exp(A)])
     = log(sum[exp(x-A)]*exp(A))
     = log(sum(exp(x-A))) + log(exp(A))
     = log(sum(exp(x-A))) + A
     可令A=max(x)，即可实现数值稳定性计算,防止exp上溢
+
+    同理：
+    log(sum(exp(A+B)))=log(sum(exp(A)))+B
+
 
     # Parameters
 

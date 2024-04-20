@@ -57,11 +57,12 @@ class TestConditionalRandomField(AllenNlpTestCase):
         # [state_num,]
         self.crf.end_transitions = torch.nn.Parameter(self.transitions_to_end)
 
-    def score(self, logits, tags):
+    def cal_score_of_numerator(self, logits, tags):
         """
-        对于给定的序列，计算概率
+        对于给定的序列，计算概率 log(p(y|x)), 但这里只计算了分子，没计算归一化的分母
         logits:[seq_len, state_num]
         tags:  [seq_len,]
+        return: double
 
         Computes the likelihood score for the given sequence of tags,
         given the provided logits (and the transition weights in the CRF model)
@@ -69,13 +70,16 @@ class TestConditionalRandomField(AllenNlpTestCase):
         # Start with transitions from START and to END
         # TODO:但我并不清楚为何最后的分布也需要指定？
         total = self.transitions_from_start[tags[0]] + self.transitions_to_end[tags[-1]]
+        # 计算转移概率
         # Add in all the intermediate transitions
         for tag, next_tag in zip(tags, tags[1:]):
             total += self.transitions[tag, next_tag] # 前后tag之间转移的分数
+            
         # Add in the logits for the observed tags
-        # logits:[seq_len, state_num],对应于CRF中各个时间步的 w*feat(xi,j,s(j-1),s(j)), feat(*)为crf中全局特征
+        # logits:[seq_len, state_num],对应于CRF中各个时间步的 w*feat(x,j,s(j-1),s(j)), feat(*)为crf中全局特征
         # tags:[seq_len]
-        # p(s|x;w) = exp(w*feat(xi,j,s(j-1),s(j)))/Z, xi指第i条样本, s为state, j为第j个时间步, Z为归一化因子
+        # p(s|x;w) = exp(w*feat(x,j,s(j-1),s(j)))/Z, xi指第i条样本, s为state, j为第j个时间步, Z为归一化因子
+        # 计算发射概率emit
         for logit, tag in zip(logits, tags):
             total += logit[tag]
         return total
@@ -100,7 +104,7 @@ class TestConditionalRandomField(AllenNlpTestCase):
         for logit, mas in zip(logits, mask):
             # 找出每个seq序列中不被mask掉的logit
             mask_indices = mas.nonzero(as_tuple=False).squeeze() # 找出非0元素
-            logit = torch.index_select(logit, 0, mask_indices)
+            logit = torch.index_select(logit, 0, mask_indices) # 只取非0位置的score
             # logit:[seq_len, state_num]
             sequence_length = logit.shape[0]
             # state_num=5
@@ -125,7 +129,7 @@ class TestConditionalRandomField(AllenNlpTestCase):
             for tag_seq in itertools.product(range(state_num), repeat=sequence_length):
                 #logit: [seq_len, state_num]
                 #tag_seq: [seq_len, ]
-                score = self.score(logit.data, tag_seq)
+                score = self.cal_score_of_numerator(logit.data, tag_seq)
                 if score > most_likelihood:
                     most_likely, most_likelihood = tag_seq, score
 
@@ -139,33 +143,47 @@ class TestConditionalRandomField(AllenNlpTestCase):
         # inputs = logits:[batch, seq_len, state_num]
         # tags:[batch, seq_len]
         # log_likelihood:[batch,]
+        # 计算batch中所有样本的log p(y|x)
         log_likelihood = self.crf.forward(inputs=self.logits, tags=self.tags).item()
 
         # Now compute the log-likelihood manually
-        manual_log_likelihood = 0.0
+        manual_log_likelihood_in_batch = 0.0
 
-        # For each instance, manually compute the numerator
+        # For each instance, manually compute the numerator(分子)
         # (which is just the score for the logits and actual tags)
         # and the denominator
         # (which is the log-sum-exp of the scores for the logits across all possible tags)
+        
+        # logits:[batch, seq_len, state_num]
+        # tags:[batch, seq_len]
+        # batch中的第i个样本
+        # logits_i:[seq_len, state_num]
+        # tags_i:[ seq_len]
         for logits_i, tags_i in zip(self.logits, self.tags):
-            numerator = self.score(logits_i.detach(), tags_i.detach())
+            numerator = self.cal_score_of_numerator(logits_i.detach(), tags_i.detach())
             all_scores = [
-                self.score(logits_i.detach(), tags_j)
+                # logits_i:[seq_len, state_num]
+                self.cal_score_of_numerator(logits_i.detach(), tags_j)
+                # tags_j:所有5种状态*时间步的枚举,即所有可能路径序列的枚举, 5^3
+                #(0, 0, 0)
+                #(0, 0, 1)
+                # ...
                 for tags_j in itertools.product(range(5), repeat=3)
             ]
             denominator = math.log(sum(math.exp(score) for score in all_scores))
             # And include them in the manual calculation.
-            manual_log_likelihood += numerator - denominator
+            manual_log_likelihood_in_batch += numerator - denominator
 
         # The manually computed log likelihood should equal the result of crf.forward.
-        assert manual_log_likelihood.item() == approx(log_likelihood)
+        assert manual_log_likelihood_in_batch.item() == approx(log_likelihood)
 
     def test_forward_works_with_mask(self):
         # Use a non-trivial mask
-        mask = torch.tensor([[True, True, True], [True, True, False]])
-
-        log_likelihood = self.crf(self.logits, self.tags, mask).item()
+        # mask:[batch, seq_len]
+        mask = torch.tensor([[True, True, True],
+                             [True, True, False]])
+        # scalar
+        log_likelihood = self.crf.forward(self.logits, self.tags, mask).item()
 
         # Now compute the log-likelihood manually
         manual_log_likelihood = 0.0
@@ -174,17 +192,19 @@ class TestConditionalRandomField(AllenNlpTestCase):
         #   (which is just the score for the logits and actual tags)
         # and the denominator
         #   (which is the log-sum-exp of the scores for the logits across all possible tags)
+        # 第i条样本
         for logits_i, tags_i, mask_i in zip(self.logits, self.tags, mask):
             # Find the sequence length for this input and only look at that much of each sequence.
             sequence_length = torch.sum(mask_i.detach())
             logits_i = logits_i.data[:sequence_length]
             tags_i = tags_i.data[:sequence_length]
 
-            numerator = self.score(logits_i, tags_i)
+            numerator = self.cal_score_of_numerator(logits_i, tags_i)
             all_scores = [
-                self.score(logits_i, tags_j)
+                self.cal_score_of_numerator(logits_i, tags_j)
                 for tags_j in itertools.product(range(5), repeat=sequence_length)
             ]
+            # log_sum_exp(w*feat(x,yi-1,yi))
             denominator = math.log(sum(math.exp(score) for score in all_scores))
             # And include them in the manual calculation.
             manual_log_likelihood += numerator - denominator
@@ -193,7 +213,8 @@ class TestConditionalRandomField(AllenNlpTestCase):
         assert manual_log_likelihood.item() == approx(log_likelihood)
 
     def test_viterbi_tags(self):
-        mask = torch.tensor([[True, True, True], [True, False, True]])
+        mask = torch.tensor([[True, True, True],
+                             [True, False, True]])
 
         viterbi_path = self.crf.viterbi_tags(self.logits, mask)
 
@@ -207,6 +228,8 @@ class TestConditionalRandomField(AllenNlpTestCase):
         assert_allclose(viterbi_scores, best_scores, rtol=1e-5)
 
     def test_viterbi_tags_no_mask(self):
+        # logits:[batch, seq_len, num_tags]
+        # # list of tags, and a viterbi score, eg:[(tag_seq, score)]
         viterbi_path = self.crf.viterbi_tags(self.logits)
 
         # Separate the tags and scores.

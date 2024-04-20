@@ -158,6 +158,11 @@ def is_transition_allowed(
 
 class ConditionalRandomField(torch.nn.Module):
     """
+    在NN+CRF中有两点不同
+    1.如pytorch中，并不需要手动求梯度，所以只需要在forward中计算loss即-log(p|x)，因此也不要前向后向算法来计算分母
+    2.NN提取特征能力较强，因此并不需要m个特征函数，只需要状态转移特征与状态发射特征，即可认为m=2
+
+
     This module uses the "forward-backward" algorithm to compute
     the log-likelihood of its inputs assuming a conditional random field model.
 
@@ -197,20 +202,24 @@ class ConditionalRandomField(torch.nn.Module):
             constraint_mask = torch.full((num_tags + 2, num_tags + 2), 0.0)
             for i, j in constraints:
                 constraint_mask[i, j] = 1.0
-
+        # constraint_mask:[numg_tags+2, num_tags+2]
         self._constraint_mask = torch.nn.Parameter(constraint_mask, requires_grad=False)
 
         # Also need logits for transitioning from "start" state and to "end" state.
         self.include_start_end_transitions = include_start_end_transitions
         if include_start_end_transitions:
+            # start_transitions:[num_tags]
+            # end_transitions:[num_tags]
             self.start_transitions = torch.nn.Parameter(torch.Tensor(num_tags))
             self.end_transitions = torch.nn.Parameter(torch.Tensor(num_tags))
 
         self.reset_parameters()
 
     def reset_parameters(self):
+        # gain*sqrt(2/(fan_in+fan_out))
         torch.nn.init.xavier_normal_(self.transitions)
         if self.include_start_end_transitions:
+            # 用正态分布初始化
             torch.nn.init.normal_(self.start_transitions)
             torch.nn.init.normal_(self.end_transitions)
 
@@ -220,8 +229,8 @@ class ConditionalRandomField(torch.nn.Module):
     ) -> torch.Tensor:
         """
         计算log P(y|x;w)中的分母，即:
-         log p(s|x;w) = log[exp(w*feat(xi,j,s(j-1),s(j)))/Z], xi指第i条样本, s为state, j为第j个时间步, Z为归一化因子,
-         分母为 logZ = log sum[exp(w*feat(xi,j,s(j-1),s(j)))], 其中feat(xi,j,s(j-1),s(j))包含了转移概率，发射概率
+         log p(s|x;w) = log[exp(w*feat(x,j,s(j-1),s(j)))/Z], x指第i条样本, s为state, j为第j个时间步, Z为归一化因子,
+         分母为 logZ = log sum[exp(w*feat(xi,j,s(j-1),s(j)))], 其中feat(x,j,s(j-1),s(j))包含了转移概率，发射概率
 
         Computes the (batch_size,) denominator term $Z(x)$, per example, for the log-likelihood
 
@@ -240,7 +249,7 @@ class ConditionalRandomField(torch.nn.Module):
         # Transpose batch size and sequence dimensions
         # mask:[batch,seq_len] -> [seq_len, batch]
         mask = mask.transpose(0, 1).contiguous()
-        # logits:[batch,seq_len, num_tags] -> [seq_len, batch, num_tags]
+        # logits:[batch, seq_len, num_tags] -> [seq_len, batch, num_tags]
         logits = logits.transpose(0, 1).contiguous()
 
         # Initial alpha is the (batch_size, num_tags) tensor of likelihoods combining the
@@ -255,22 +264,23 @@ class ConditionalRandomField(torch.nn.Module):
             # alpha:[batch, num_tags]
             alpha = logits[0] # 只用发射概率初始化
 
+        # Transition scores are (current_tag, next_tag) so we broadcast along the instance axis.
+        # transitions:[num_tags, num_tags], 当前状态到下一状态的转移概率
+        # transition_scores:[1, num_tags(当前状态), num_tags(下一状态)], 当前状态到下一状态的转移概率
+        transition_scores = transitions.view(1, num_tags, num_tags)
+
         # alpha(t, s):是前向后向算法里的前向节点,代表第t个时间步，到达状态s的概率
-        # psai(xi,st-1,st,t) = w*feat(xi, j, sj-1, sj), 这里包含了转移概率与发射概率
+        # psai(x,st-1,st,t) = w*feat(x, j, sj-1, sj), 这里包含了转移概率与发射概率
         # alpha(t,s) = sum_{s'} {alpha(t-1, s') * psai(s',s,t) }, s'为t-1时的状态
-        # 在log下，所有的相乘均就为相加
+        # 在log下，所有的相乘均为相加
         # For each t we compute logits for the transitions from timestep t-1 to timestep t.
         # We do so in a (batch_size, num_tags, num_tags) tensor where the axes are
         # (instance, current_tag, next_tag)
         for t in range(1, sequence_length): # [1, seq_len-1]
             # The emit scores are for time t ("next_tag") so we broadcast along the current_tag axis.
             # logits: [seq_len, batch, num_tags]
-            # emit_scores:[batch, 1, num_tags]
+            # emit_scores:[batch, 1, num_tags], 时间步t当前各状态s下发射x[t]的概率
             emit_scores = logits[t].view(batch_size, 1, num_tags)
-            # Transition scores are (current_tag, next_tag) so we broadcast along the instance axis.
-            # transitions:[num_tags, num_tags], 当前状态到下一状态的转移概率
-            # transition_scores:[1, num_tags(当前状态), num_tags(下一状态)], 当前状态到下一状态的转移概率
-            transition_scores = transitions.view(1, num_tags, num_tags)
 
             # Alpha is for the current_tag, so we broadcast along the next_tag axis.
             # broadcast_alpha:[batch, num_tags, 1]
@@ -278,7 +288,7 @@ class ConditionalRandomField(torch.nn.Module):
             broadcast_alpha = alpha.view(batch_size, num_tags, 1)
 
             # Add all the scores together and logexp over the current_tag axis.
-            # inner:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
+            # weight:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
             # 这里的inner就是前向计算中的alpha
 
             # 前向计算公式
@@ -296,17 +306,28 @@ class ConditionalRandomField(torch.nn.Module):
             # broadcast_alpha:[batch, num_tags, 1], 到达当前state的概率
             # transition_scores:[1, num_tags, num_tags], 当前状态到下一状态的转移概率
             # emit_scores:[batch, 1, num_tags], 下一状态的发射概率
-            # inner:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
-            inner = broadcast_alpha + transition_scores + emit_scores
+            # weight_x_feat:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
+            weight_x_feat = broadcast_alpha + transition_scores + emit_scores
 
+            """
+            transition:
+                s1  s2
+            s1  0.2 0.8
+            s2  0.6 0.4 
+            因此,
+            t+1到s1的概率为：0.2+0.6=0.8
+            t+1到s2的概率为：0.8+0.4=1.2
+            即transition.sum(dim=0)=[[0.8,1.2]]
+            """
             # In valid positions (mask == True) we want to take the logsumexp over the current_tag dimension
-            # of `inner`. Otherwise (mask == False) we want to retain the previous alpha.
+            # of `weight`. Otherwise (mask == False) we want to retain the previous alpha.
             # mask[t]:[batch]
-            # inner:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
-            # tag_score:[batch, num_tags], log{sum{exp(w*feat(s',s,x,t))}}
-            tag_score = util.logsumexp(inner, 1) # dim=1是按当前状态进行sum
+            # weight_x_feat:[batch, num_tags, num_tags], 即[样本下标,当前状态,下一状态]
+            # current_tag_score:[batch, num_tags], log{sum{exp(w*feat(s',s,x,t))}}
+            # dim=1是按当前状态进行sum, 参照上面的例子，其物理意义是到达current_tag的概率之和
+            current_tag_score = util.logsumexp(weight_x_feat, dim=1)
             # alpha:[batch, num_tags]
-            alpha = (tag_score * mask[t].view(batch_size, 1) + alpha * (~mask[t]).view(batch_size, 1))
+            alpha = (current_tag_score * mask[t].view(batch_size, 1) + alpha * (~mask[t]).view(batch_size, 1))
 
         # Every sequence needs to end with a transition to the stop_tag.
         if self.include_start_end_transitions:
@@ -339,15 +360,15 @@ class ConditionalRandomField(torch.nn.Module):
     ) -> torch.Tensor:
         """
         计算log P(y|x;w)中的分子，即:
-         log p(s|x;w) = log[exp(w*feat(xi,j,s(j-1),s(j)))/Z], xi指第i条样本, s为state, j为第j个时间步, Z为归一化因子,
-         分子为w*feat(xi,j,s(j-1),s(j), 其中feat(xi,j,s(j-1),s(j))包含了转移概率，发射概率
+         log p(s|x;w) = log[exp(w*feat(x,j,s(j-1),s(j)))/Z], x指第i条样本, s为state, j为第j个时间步, Z为归一化因子,
+         分子为w*feat(x,j,s(j-1),s(j), 其中feat(x,j,s(j-1),s(j))包含了转移概率，发射概率
 
-         w*feat(xi,j,s(j-1),s(j))
-         = sum_{k,j}[alpha_k*t_k(yj-1,yj,xi)] + sum_{l,j}*[beta_l* s_l(yj,xi,j)]
+         w*feat(x,j,s(j-1),s(j))
+         = sum_{k,j}[alpha_k*t_k(yj-1,yj,x)] + sum_{l,j}*[beta_l* s_l(yj,x,j)]
          = alpha*转移概率 + beta*发射概率
          其中t_k:代表第k个转移特征，s_l:代表第l个状态特征
-         而在一般在DL中，t_k，s_l只有一个t,s，可以认为前面的NN已将这些相同时间步的不同特征相加得到一个总特征，
-         即:t=sum_{k}{s_k}, s=sum_{l}{s_l}
+         而在一般在NN+CRF中，t_k，s_l只有一个t1,s1，可以认为前面的NN已将这些相同时间步的不同特征相加得到一个总特征，
+         即:t1=sum_{k}{s_k}, s1=sum_{l}{s_l}
 
         Computes the numerator term for the log-likelihood, which is just score(inputs, tags)
         Args:
@@ -359,12 +380,12 @@ class ConditionalRandomField(torch.nn.Module):
         Returns:
             torch.Tensor: numerator term for the log-likelihood, which is just score(inputs, tags)
         """
-        batch_size, sequence_length, _ = logits.data.shape
+        batch_size, sequence_length, _ = logits.data.shape # logits一般是进入exp归一化之前的值
 
         # Transpose batch size and sequence dimensions:
         # logits:[batch, seq_len, num_tags] -> [seq_len, batch, num_tags]
-        # 在NN+CRF中，logits就是发射概率，直接取就行,而不是当成特征再乘以权重w
-        logits = logits.transpose(0, 1).contiguous()
+        # 在NN+CRF中，logits就是发射概率，直接取就行,而不是当成发射特征再乘以发射权重w
+        logits = logits.transpose(0, 1).contiguous() # contiguous重新分配了数据内存
         # mask:[batch, seq_len] -> [seq_len, batch]
         mask = mask.transpose(0, 1).contiguous()
         # tags:[batch, seq_len] -> [seq_len, batch]
@@ -405,7 +426,7 @@ class ConditionalRandomField(torch.nn.Module):
             #  (2,0)
             # ...]
             #
-            # dim=1,因此将index的值依次填index_of_index对应的dim=1上
+            # dim=1,因此将index=current_tag的元素依次填index_of_index对应的dim=1上
             # new_index=
             # [(0,tag1)
             #  (1,tag2)
@@ -413,7 +434,7 @@ class ConditionalRandomField(torch.nn.Module):
             # ...]
             # 从logits[t]取new_index的值
             # [[s1],[s2],...]
-            # emit_score_origin: [batch,1], 即每条样本它的state所对应的发射分数
+            # emit_score_origin: [batch,1], 即每条样本在t时刻到达state=current_tag状态的发射分数
             emit_score_origin = logits[t].gather(dim=1, index=current_tag.view(batch_size, 1))
             # emit_score: [batch]
             emit_score = emit_score_origin.squeeze(1)
@@ -432,7 +453,7 @@ class ConditionalRandomField(torch.nn.Module):
         # last_tag_index:[batch]
         last_tag_index = mask.sum(0).long() - 1
         # tags:[seq_len, batch]
-        # tags:[batch], 获取每条样本最后的tag
+        # tags:[batch], 获取每条样本最后的state tag
         last_tags = tags.gather(0, last_tag_index.view(1, batch_size)).squeeze(0)
 
         # Compute score of transitioning to `stop_tag` from each "last tag".
@@ -470,24 +491,31 @@ class ConditionalRandomField(torch.nn.Module):
         Returns:
             torch.Tensor: (batch_size,) log likelihoods $log P(y|x)$ for each input
         """
+        # mask:[batch, seq_len]
         if mask is None:
             mask = torch.ones(*tags.size(), dtype=torch.bool, device=inputs.device)
         else:
             # The code below fails in weird ways if this isn't a bool tensor, so we make sure.
             mask = mask.to(torch.bool)
 
-        # p(y|x;w) = exp(w*feat(xi,j,y(j-1),y(j)))/Z, xi指第i条样本,y为state, j为第j个时间步, Z为归一化因子
-        # log p(y|x)
-        # 求解分母,log_Z=log(sum(p(y|x;w))) over all y1~yt序列
-        # inputs:[batch,seq_len, state_num]
-        # transitions:[state_num, state_num]
+        # p(y|x;w) = exp(w*feat(x,j,y(j-1),y(j)))/Z, xi指第i条样本,y为state, j为第j个时间步, Z为归一化因子
+        # log p(y|x) = w*feat(x,j,y(j-1),y(j)) - log(sum(p(y|x;w)))
+        # 其中
+        # 分子: w*feat(x,j,y(j-1),y(j))
+        # 分母:log_Z=log(sum(p(y|x;w))) over all y1~yt序列
+
+        # 求解分子: w*feat(xi,j,y(j-1),y(j))
+        # inputs:[batch, seq_len, num_tags]
+        # mask:[batch, seq_len]
+        # log_numerator:[batch]
+        log_numerator = self._joint_likelihood(inputs, self.transitions, tags, mask)
+
+        # 分母
+        # inputs:[batch,seq_len, num_tags]
+        # transitions:[state_num, num_tags]
         # mask:[batch, seq_len]
         # log_denominator:[batch]
         log_denominator = self._input_likelihood(inputs, self.transitions, mask) # 求解分母
-
-        # 求解分子: w*feat(xi,j,y(j-1),y(j))
-        # log_numerator:[batch]
-        log_numerator = self._joint_likelihood(inputs, self.transitions, tags, mask)
 
         # result:[1], sum of log(p(y|x;w)) in batch, log(p|x;w)= w*feat(xj,j,y(j-1),y(j)) - Z
         return torch.sum(log_numerator - log_denominator)
@@ -506,74 +534,83 @@ class ConditionalRandomField(torch.nn.Module):
         For backwards compatibility, if top_k is None, then instead returns a flat list of
         tag sequences (the top tag sequence for each batch item).
         """
+        # logits:[batch, seq_len, num_tags]
         if mask is None:
+            # mask:[batch, seq_len]
             mask = torch.ones(*logits.shape[:2], dtype=torch.bool, device=logits.device)
-
+        # 求取top_k的解码序列
         if top_k is None:
             top_k = 1
-            flatten_output = True
+            flatten_output = True # 返回list
         else:
-            flatten_output = False
+            flatten_output = False # 返回list of list
 
         _, max_seq_length, num_tags = logits.size()
 
+        # tensor.data、tensor.detach与原张量，其中⼀个数值变化其他两个也随之变化，但是detach/tensor.data不参与原张量所在的微分传导图
+        # 即tensor.data不参与梯度反向传播，现在一般用tensor.detach()
         # Get the tensors out of the variables
+        # logits:[batch, seq_len, num_tags]
+        # mask:[batch, seq_len]
         logits, mask = logits.data, mask.data
 
         # Augment transitions matrix with start and end transitions
-        start_tag = num_tags
-        end_tag = num_tags + 1
+        start_tag_index = num_tags # 共有num_tags+2个状态，index=num_tags为开始状态，index=num_tags+1为结束状态
+        end_tag_index = num_tags + 1
+        # 加了两个终结状态开始状态，结束状态
+        # transitions:[num_tags+2, num_tags+2]
         transitions = torch.full((num_tags + 2, num_tags + 2), -10000.0, device=logits.device)
 
         # Apply transition constraints
-        constrained_transitions = self.transitions * self._constraint_mask[
-            :num_tags, :num_tags
-        ] + -10000.0 * (1 - self._constraint_mask[:num_tags, :num_tags])
-        transitions[:num_tags, :num_tags] = constrained_transitions.data
+        # constrained_transitions:[num_tags+2, num_tags+2]
+        constrained_transitions = (self.transitions * self._constraint_mask[:num_tags, :num_tags]
+                                   + -10000.0 * (1 - self._constraint_mask[:num_tags, :num_tags]))
+        # 不需要梯度,或者用detach()也可以
+        #transitions[:num_tags, :num_tags] = constrained_transitions.data
+        transitions[:num_tags, :num_tags] = constrained_transitions.detach()
 
         if self.include_start_end_transitions:
-            transitions[
-                start_tag, :num_tags
-            ] = self.start_transitions.detach() * self._constraint_mask[
-                start_tag, :num_tags
-            ].data + -10000.0 * (
-                1 - self._constraint_mask[start_tag, :num_tags].detach()
-            )
-            transitions[:num_tags, end_tag] = self.end_transitions.detach() * self._constraint_mask[
-                :num_tags, end_tag
-            ].data + -10000.0 * (1 - self._constraint_mask[:num_tags, end_tag].detach())
+            # start_transitions:[num_tags]
+            transitions[start_tag_index, :num_tags] = (self.start_transitions.detach() * self._constraint_mask[start_tag_index, :num_tags].data
+                                                       + -10000.0 * (1 - self._constraint_mask[start_tag_index, :num_tags].detach())
+                                                       )
+            transitions[:num_tags, end_tag_index] = (self.end_transitions.detach() * self._constraint_mask[:num_tags, end_tag_index].data
+                                                     + -10000.0 * (1 - self._constraint_mask[:num_tags, end_tag_index].detach()))
         else:
-            transitions[start_tag, :num_tags] = -10000.0 * (
-                1 - self._constraint_mask[start_tag, :num_tags].detach()
-            )
-            transitions[:num_tags, end_tag] = -10000.0 * (
-                1 - self._constraint_mask[:num_tags, end_tag].detach()
-            )
+            transitions[start_tag_index, :num_tags] = -10000.0 * (1 - self._constraint_mask[start_tag_index, :num_tags].detach())
+            transitions[:num_tags, end_tag_index] = -10000.0 * (1 - self._constraint_mask[:num_tags, end_tag_index].detach())
 
         best_paths = []
-        # Pad the max sequence length by 2 to account for start_tag + end_tag.
+        # Pad the max sequence length by 2 to account for start_tag_index + end_tag_index.
+        # tag_sequence:[seq_len+2, num_tags+2]
         tag_sequence = torch.empty(max_seq_length + 2, num_tags + 2, device=logits.device)
 
+        # logits:[batch, seq_len, num_tags]
+        # mask:  [batch, seq_len]
+        # prediction:[seq_len, num_tags]
+        # prediction_mask:[seq_len]
         for prediction, prediction_mask in zip(logits, mask):
             mask_indices = prediction_mask.nonzero(as_tuple=False).squeeze()
-            masked_prediction = torch.index_select(prediction, 0, mask_indices)
-            sequence_length = masked_prediction.shape[0]
+            masked_pred_logits = torch.index_select(prediction, 0, mask_indices)
+            sequence_length = masked_pred_logits.shape[0]
 
             # Start with everything totally unlikely
             tag_sequence.fill_(-10000.0)
             # At timestep 0 we must have the START_TAG
-            tag_sequence[0, start_tag] = 0.0
+            tag_sequence[0, start_tag_index] = 0.0
             # At steps 1, ..., sequence_length we just use the incoming prediction
-            tag_sequence[1 : (sequence_length + 1), :num_tags] = masked_prediction
+            tag_sequence[1 : (sequence_length + 1), :num_tags] = masked_pred_logits
             # And at the last timestep we must have the END_TAG
-            tag_sequence[sequence_length + 1, end_tag] = 0.0
+            tag_sequence[sequence_length + 1, end_tag_index] = 0.0
 
+            # 只取mask==1处的tag seq
             # We pass the tags and the transitions to `viterbi_decode`.
             viterbi_paths, viterbi_scores = util.viterbi_decode(
                 tag_sequence=tag_sequence[: (sequence_length + 2)],
                 transition_matrix=transitions,
                 top_k=top_k,
             )
+
             top_k_paths = []
             for viterbi_path, viterbi_score in zip(viterbi_paths, viterbi_scores):
                 # Get rid of START and END sentinels and append.

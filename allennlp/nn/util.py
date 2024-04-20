@@ -411,6 +411,13 @@ def viterbi_decode(
     top_k: int = None,
 ):
     """
+    在HMM的解码中只需要状态转移矩阵:[num_tags,num_tags]，状态发射矩阵:[num_tags, observed_tag_num]，初始状态:[num_tags]，以及观察序列，然后进行viterbi解码
+
+    但在CRF中，是判别模型，
+    给出的tag_sequence是各时间步下各状态state发射可观测的标记x[t]的概率，
+    因此crf与hmm的不同是，hmm是生成模型，hmm中有观测独立性假设，即p(x[t]|s[t]) t时刻的发射概率只与t时刻的状态有关
+    crf中 t时刻的判别概率不仅与t时刻的状态有关，而且还与x有关，因此每个时刻的概率分数不同,即[seq_len, num_tags]
+
     Perform Viterbi decoding in log space over a sequence given a transition matrix
     specifying pairwise (transition) potentials between tags and a matrix of shape
     (sequence_length, num_tags) specifying unary potentials for possible tags per
@@ -460,6 +467,7 @@ def viterbi_decode(
     else:
         raise ValueError(f"top_k must be either None or an integer >=1. Instead received {top_k}")
 
+    # tag_sequences:[seq_len, num_tags],不同时刻的状态发射分数
     sequence_length, num_tags = list(tag_sequence.size())
 
     has_start_end_restrictions = (
@@ -479,12 +487,8 @@ def viterbi_decode(
 
         # Start and end transitions are fully defined, but cannot transition between each other.
 
-        allowed_start_transitions = torch.cat(
-            [allowed_start_transitions, torch.tensor([-math.inf, -math.inf])]
-        )
-        allowed_end_transitions = torch.cat(
-            [allowed_end_transitions, torch.tensor([-math.inf, -math.inf])]
-        )
+        allowed_start_transitions = torch.cat([allowed_start_transitions, torch.tensor([-math.inf, -math.inf])])
+        allowed_end_transitions = torch.cat([allowed_end_transitions, torch.tensor([-math.inf, -math.inf])])
 
         # First define how we may transition FROM the start and end tags.
         new_transition_matrix[-2, :] = allowed_start_transitions
@@ -529,11 +533,24 @@ def viterbi_decode(
     # Evaluate the scores for all possible paths.
     for timestep in range(1, sequence_length):
         # Add pairwise potentials to current scores.
+        # path_scores[i]:[1, num_tags]
+        # transition_matrix:[num_tags, num_tags]
+        # summed_potentials: [1, num_tags, num_tags]
+        # summed_potentials的物理意义是：求到达当前state的势能之和，包括转移到当前状态以及发射概率
+        """
+            s1  s2
+        s1 [0.1 0.9]
+        s2 [0.3 0.7]
+        """
         summed_potentials = path_scores[timestep - 1].unsqueeze(2) + transition_matrix
+        # summed_potentials: [num_tags, num_tags]
         summed_potentials = summed_potentials.view(-1, num_tags)
 
         # Best pairwise potential path score from the previous timestep.
         max_k = min(summed_potentials.size()[0], top_k)
+        # summed_potentials: [num_tags, num_tags]
+        # scores:[max_k, num_tags], 第一行第一列是达到s1的top1,第二行第一列是达到s1的top2,依次类推
+        # paths:[index_of_max_k, num_tags]
         scores, paths = torch.topk(summed_potentials, k=max_k, dim=0)
 
         # If we have an observation for this timestep, use it
@@ -548,21 +565,29 @@ def viterbi_decode(
                     "observations is extremely unlikely. Double check your evidence "
                     "or transition potentials!"
                 )
-        if observation != -1:
+        if observation != -1: # 有传入观测的标记
             one_hot = torch.zeros(num_tags)
             one_hot[observation] = 100000.0
             path_scores.append(one_hot.unsqueeze(0))
         else:
+            # tag_sequence[time, :]: [1, num_tags], 可以认为是发射概率
+            # scores:[top_k, num_tags], 转移概率
+            # path_scores: List[ [top_k, num_tags]]
             path_scores.append(tag_sequence[timestep, :] + scores)
-        path_indices.append(paths.squeeze())
+
+        path_indices.append(paths.squeeze()) # path_indices:List[ [top_k, num_tags] ]
 
     # Construct the most likely sequence backwards.
+    # path_scores: List[ [top_k, num_tags]]
+    # path_scores_v: [num_tags], 最后时刻到达的状态
     path_scores_v = path_scores[-1].view(-1)
     max_k = min(path_scores_v.size()[0], top_k)
     viterbi_scores, best_paths = torch.topk(path_scores_v, k=max_k, dim=0)
+
     viterbi_paths = []
     for i in range(max_k):
         viterbi_path = [best_paths[i]]
+        # path_indices:List[ [top_k, num_tags] ]
         for backward_timestep in reversed(path_indices):
             viterbi_path.append(int(backward_timestep.view(-1)[viterbi_path[-1]]))
         # Reverse the backward path.
@@ -572,6 +597,7 @@ def viterbi_decode(
             viterbi_path = viterbi_path[1:-1]
 
         # Viterbi paths uses (num_tags * n_permutations) nodes; therefore, we need to modulo.
+        # 因为有可能取topK条路径，此时需要取模
         viterbi_path = [j % num_tags for j in viterbi_path]
         viterbi_paths.append(viterbi_path)
 

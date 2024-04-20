@@ -251,5 +251,6 @@ class TransformerLayer(TransformerModule, FromParams):
         final_kwargs["intermediate_size"] = config.intermediate_size
         final_kwargs["activation"] = config.hidden_act
         final_kwargs["add_cross_attention"] = config.add_cross_attention
+        # 将kwargs加入至final_kwargs
         final_kwargs.update(**kwargs)
         return cls(**final_kwargs)

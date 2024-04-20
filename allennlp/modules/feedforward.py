@@ -12,6 +12,10 @@ from allennlp.nn import Activation
 
 class FeedForward(torch.nn.Module, FromParams):
     """
+    所谓的feedforward就是多层
+    List(Linear -> Activate -> Dropout) , 并没有特殊
+
+
     This `Module` is a feed-forward neural network, just a sequence of `Linear` layers with
     activation functions in between.
 

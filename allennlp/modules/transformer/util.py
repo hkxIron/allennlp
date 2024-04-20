@@ -3,7 +3,7 @@ import torch
 from allennlp.nn.util import min_value_of_dtype
 
 # Unfortunately mypy is insane, so we have to wrap these in unions.
-FloatT = Union[torch.FloatTensor]
+FloatT = Union[torch.FloatTensor] # union只有一个元素时，就是元素本身，Union[int]==int
 IntT = Union[torch.IntTensor]
 BoolT = Union[torch.BoolTensor]
 

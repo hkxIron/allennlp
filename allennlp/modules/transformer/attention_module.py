@@ -104,6 +104,7 @@ class AttentionModule(TransformerModule, FromParams):
         self.attention_head_size = attention_head_size
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
+        # w_query:[hidden_size, all_head_size=num_head*head_dim]
         self.query = torch.nn.Linear(hidden_size, self.all_head_size, bias=bias)
         self.key = torch.nn.Linear(hidden_size, self.all_head_size, bias=bias)
         self.value = torch.nn.Linear(hidden_size, self.all_head_size, bias=bias)

@@ -8,6 +8,9 @@ from allennlp.modules.transformer.transformer_module import TransformerModule
 from transformers.models.bert.modeling_bert import ACT2FN
 
 
+"""
+注意：这里的激活层都带了一个dense layer
+"""
 class ActivationLayer(TransformerModule, FromParams):
     def __init__(
         self,
@@ -17,7 +20,7 @@ class ActivationLayer(TransformerModule, FromParams):
         pool: bool = False,
     ):
         super().__init__()
-        self.dense = torch.nn.Linear(hidden_size, intermediate_size)
+        self.dense = torch.nn.Linear(in_features=hidden_size, out_features=intermediate_size)
         if isinstance(activation, str):
             self.act_fn = ACT2FN[activation]
         else:
